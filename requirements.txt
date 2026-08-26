@@ -4,9 +4,9 @@ Pillow>=9.0.0
 opencv-python-headless>=4.5.0
 onnxruntime>=1.16.0,<1.19.0
 
-# Web server
+# Web server - REMOVE gunicorn if you don't want it
 flask>=3.0.0
-gunicorn>=21.2.0
+# gunicorn>=21.2.0  # Comment this out
 
 # Asynchronous HTTP & File Handling
 aiohttp>=3.8.0
