@@ -1,0 +1,1479 @@
+import json
+import os
+
+# Load .env file at the absolute start of the script
+def load_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ[k.strip()] = v.strip().strip("'\"")
+        except Exception:
+            pass
+
+load_env()
+
+# Suppress ONNX Runtime log spam (keep ERROR level only)
+os.environ.setdefault('ORT_LOGGING_LEVEL', '3')
+# NOTE: ORT_DISABLE_THREAD_AFFINITY is intentionally NOT set here so that
+# ONNX Runtime can pin its intra-op threads to dedicated cores on multi-core VPS.
+
+import random
+import re
+import string
+import time
+import warnings
+import math
+import threading
+import datetime
+import asyncio
+import aiohttp
+from aiohttp import web
+import aiofiles
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from urllib.parse import urlparse
+import dun163_py
+import onnxruntime as ort
+from loguru import logger
+# Optional PyTorch imports for Type 7 solver
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    torch = None
+    # Stub nn.Module so class Mini(nn.Module) definition doesn't throw NameError
+    class DummyModule:
+        def __init__(self, *args, **kwargs): pass
+    class nn_stub:
+        Module = DummyModule
+    nn = nn_stub
+
+from collections import OrderedDict
+import queue
+import sqlite3
+from fake_useragent import UserAgent
+
+try:
+    from api_image_solver import APIImageSolver
+    HAS_PYTORCH_SOLVER = True
+except ImportError:
+    APIImageSolver = None
+    HAS_PYTORCH_SOLVER = False
+
+from api_image_solver_onnx import APIImageSolverONNX
+
+# Suppress warnings
+if HAS_TORCH:
+    warnings.filterwarnings("ignore", category=torch.serialization.SourceChangeWarning)
+warnings.filterwarnings("ignore", message=".*SIFT_create.*deprecated.*")
+
+# Constants
+DEBUG = False
+USE_IRTOKEN = True
+DIR_PATH = os.path.dirname(os.path.abspath(__file__))
+USE_CUDA = False
+if HAS_TORCH:
+    USE_CUDA = True if torch.cuda.is_available() else False
+DEVICE = 'cuda' if USE_CUDA else 'cpu'
+
+import redis.asyncio as redis
+
+# ... (imports)
+
+# Config
+CONFIG_FILE = os.path.join(DIR_PATH, "config.json")
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading config: {str(e)}")
+    return {}
+
+config = load_config()
+
+# Redis Config
+redis_config = config.get("redis", {})
+redis_enabled = redis_config.get("enabled", False)
+redis_host = redis_config.get("host", "localhost")
+redis_port = redis_config.get("port", 6379)
+redis_username = redis_config.get("username", "")
+redis_password = redis_config.get("password", "")
+redis_key_prefix = redis_config.get("key_prefix", "mtoken:")
+redis_token_list = f"{redis_key_prefix}tokens"
+redis_token_saved_count = f"{redis_key_prefix}tokens:saved"
+
+# MongoDB Config
+try:
+    from pymongo import MongoClient
+except ImportError:
+    MongoClient = None
+
+mongo_config = config.get("mongodb", {})
+mongo_enabled = mongo_config.get("enabled", False)
+mongo_uri = mongo_config.get("uri", "mongodb+srv://j41a:xxxxxxx@cn31.iv8bazt.mongodb.net/")
+mongo_db_name = mongo_config.get("db", "yidun")
+mongo_collection_name = mongo_config.get("collection", "cn31_tokens")
+mongo_ttl_seconds = mongo_config.get("ttl_seconds", 600)
+
+# Global MongoDB resources
+mongo_collection = None
+mongo_queue = queue.Queue()
+
+# SQLite Config
+sqlite_enabled = False
+sqlite_db_path = os.path.join(DIR_PATH, "tokens.db")
+sqlite_queue = queue.Queue()
+
+
+# irToken handling: fetch one at startup via request_up() and reuse it
+# across all workers. The Redis-backed and in-memory pools that lived
+# here previously have been removed -- a single token + fresh session
+# per attempt is enough to sustain throughput.
+
+solver_config = config.get("solver", {})
+USE_ONNX_SOLVER    = solver_config.get("use_onnx", False)
+USE_GPU_SOLVER     = solver_config.get("use_gpu", USE_CUDA)
+USE_FP16_MODEL     = solver_config.get("use_fp16", False)
+USE_INT8_MODEL     = solver_config.get("use_int8", False)
+SOLVER_MODEL_PATH  = solver_config.get("model", None)
+
+# This script is hard-wired to the pure-Python dun163 port -- no
+# Node/V8 / execjs dependency. The port is byte-for-byte verified by
+# test_dun163_port.py (258/258 tests pass).
+
+# Global Resources
+redis_client = None
+redis_queue = asyncio.Queue()
+
+# Configuration from bypasser-og.py
+REFERER = "https://mtacc.mobilelegends.com/"
+ID = "fef5c67c39074e9d845f4bf579cc07af"
+FP_H = "mtacc.mobilelegends.com"
+
+DUN163_DOMAINS = [
+    "https://c.dun.163.com",
+    # "https://c.dun.163yun.com"
+]
+
+# ============ HELPER FUNCTIONS (Copied from mlbb.py) ============
+
+def generate_random_ip():
+    return f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
+
+def generate_nonce():
+    import hashlib
+    raw = f"{time.time_ns()}{os.urandom(16)}"
+    nonce = hashlib.md5(raw.encode()).hexdigest()
+    return nonce
+
+async def request_up():
+    """Get irToken (Async)"""
+    headers = {
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Origin': 'https://mtacc.mobilelegends.com',
+        'Referer': 'https://mtacc.mobilelegends.com/',
+        'User-Agent': UserAgent().random,
+        'content-type': 'text/plain',
+    }
+    raw_data = '''{"p":"YD00192283058223","v":"2.0.10_yanzhengma","vk":"d44593ca","n":"NONCE_HERE","d":"8Kox+pphnNz8VtQed9pBFk0w/pmaNYZ0EKMqFEInrGPJOk9slJTAVroBAm6AUIK1wWQkPMRcs3uhF+GGWE1E8.J/PvoIiiksvU+avJO0BRQnWen5cuB4mLutQvG6OjMC0HFxlIqGwr8ZkrIWJbzQsNz4wvDERttdDjUIK+9hcVbYpWHavAt.NnV3ZR5rp3AwQQhXkvvK9vzcML1tsQMsxuAHZT.s6z6ZR1cpnt8nCkjw8Q8i3o/l8ZT3NqPYc5RjThpoZ2+AD2kgF9cxeVMm8r9OfM9vvs10/IGNiimctzOkNRvRhnD0oU48zZ5rl3H38NNTxrbBrx5nZEg4GT1Gyx53TedSjbdTXk/ksGtrXo1o0XbtLPdiKAwFgNRtlMCs1yKBZzkzDIEKipW+txH+RCgp6NYP/O0t1cwab0kcT5sqKbbbwfqcQMi6RFnnq2QDPpyLvoff/si2PdNsNhd6gmtEKvcAQiWLZZ2iuEmD.BNJmN9s2nWlBHGol950l6tc5ImwYxfroGw80tTATTJmCG6n6V6x/e+QQpfDHvDCoH5zDbSkTa3VTq2VxmqP.HxamZiP4StoUiuzkW2apiZ2.zGVVlUMWHbX.EgpaRdAjG0ruN3Hmj/6nzAHf5HsmqPM.RPQOGxUTGarXp.gtTGwkALwAXt+49WqUdM6xjrHRtjS3qmWRcEDBIcW2Zl1FZCCX4MzQMGfBlqjvtouAhoErFWmRl.+OZpIwkV59GmEdgxtocc8ctW8s.2oxdFDYOhbV/HNBDXeb0WPvD+KeTlHj+cbjmBKwEcFfV+fDJPPV0KQvtF2EOxJZ3BBrYMP2Om5jBnPykaQQyHnZlWGvCVjiwOHovDvTV+s.Bei8l5x3IOA3A0ozOA6d1MganMZ1UVWRUg1ELcn+mzR6+Lav12mRicYmeG4USh/uQ.8cvJDrDPB.DP0yJ/QLsdG6q2LFRcU0bEg2shvijv260caFpjeeD84z34DYs1iL/AdkdyhyDaEcMuv.jwEoaRESDqHBjMCVNoBolGIUCtjiPmen6ejMepn/wDtXbUEoDX0xLYtu0z/Z++DonBoTdRBYmMUC4M/aPpZVg1vlttkRu6S2RMIREf.t+8XofGHbtya3bv5.wu9S4xIg4TbloH+1ADyvFBFZ4ksO52TQyUy+jf+Osq+FlrWiMDy.VUMzETUIrG+U6uA0B36fQqyOpQCAjqdC+p3Dr304iSEZBqiYMPziKscvMqxsPD/o+k1mnQO2tTcxUeZt8XaUlFpgJk4O9baxcG3ow1kH50bo2GmFEJVQPOUuUpJuntgEZfWFGY3C1A4Hphlw/rjb4R8RRDWMVzYr6/pPWNdR9OS1Vhlm0vHG3dYu4dpxLumBJPI8brucOaMw4Jfq1gXqDbDpedwNJq6uzSzkGK09S.BkstIfmTwMoH9fNHTrY1.uQr2yd35IEQNx9PdkcCowwGtD.ZciFKzLmC0UrtLsF6A5LemeIPmPkCs5j+VH0RIXkAX3SH0NZE44OadBdAgBcII0eloGoDz.CVwOThMG9agPk0eiHOYg51DW8Jxf6s4Mamjns3AUL0gNrgrSUFG35X+tGxRgZ5Ed1Xt2Nl/qlYwdv3jeXUD9L8G5BPia9R/o4kH8MYpzP+5b/a/SAp5poC6VCaI23olENSJ5XDQReaR+EP9HZP+OzNIRWTq69ARw.WcjU+N6LcEH6PsKam3a82IklqnPWdmdCT11EkRvtR4J/r1ZBKlOZERubadsZpIs39rJGgHEuxb1symNN6OrCuXTOgnaYe/1J/Av8/qaE+9dISB.R/BdhGmbgVMJYYb0WOjqBkSt6twcOfLgYFrHobq208wM2MCdrY4dQYRLrf4hs2MkGeT/rztwxP/CfUotyKG.2.umIAf1JdTMMzTXjiRpYIwgWayTOj2NjKno1lC4LXvevca4px+zR8jdARUGB80.xK4VDAKrKj+v28+vd9usgNxnBy8ascRkkOag8fAj1SCsDE.FGQw1Um0xmgcDLWOa/oKo/AkdM/2NECpJ+2kf51BM/vC1doUTx.+hjRxo4g90KJoWFy5QGP2HU/ufLwYWphzAbEEQznXuJW//i2SHdnIEZijiufxXSSRLTq2qjBlLi+hhDm9ZEQqU+cwRZ63VHWaxR1Ad3A/mgVzeLQhNziqp2g4vZgMX39Y+qYDK+hs+5jN5cgO88ugu5e+k/XzlXyVwz6.kGW/NCezHJxBNn9QwyTdIN2ZpRJp1RymPS44KxG3cy+U6V4FXBwhV4Fi6eynxp61AYVqahrsftdgDbGcwKwMFC2Lb.GgTRnd9MDAQPJAP5zphjnu2n+fofdoA16326DxOrzzD/jTKJu4naZyDM9btpcREsoxlbcNx2R2tz0EOKs+oZJ+zwLGitY/5zDoT.xz04tuPhVYz3I.lQGsj+tsdHNc.3jMZbYKhmaL/vV0AldmfID2g4l+xnOaXPTiH.BcPWt0E0Of"}'''
+
+    data = raw_data.replace("NONCE_HERE", generate_nonce())
+    async with aiohttp.ClientSession() as session:
+        async with session.post('https://ir-sdk.dun.163.com/v4/j/up', headers=headers, data=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            resp_json = await response.json()
+            return resp_json['data']['tk']
+
+def rotate_about_center(src, angle, scale=1.):
+    try:
+        w = src.shape[1]
+        h = src.shape[0]
+        rangle = np.deg2rad(angle)
+        nw = (abs(np.sin(rangle)*h) + abs(np.cos(rangle)*w))*scale
+        nh = (abs(np.cos(rangle)*h) + abs(np.sin(rangle)*w))*scale
+        rot_mat = cv2.getRotationMatrix2D((nw*0.5, nh*0.5), angle, scale)
+        rot_move = np.dot(rot_mat, np.array([(nw-w)*0.5, (nh-h)*0.5,0]))
+        rot_mat[0,2] += rot_move[0]
+        rot_mat[1,2] += rot_move[1]
+        return cv2.warpAffine(src, rot_mat, (int(math.ceil(nw)), int(math.ceil(nh))), flags=cv2.INTER_LINEAR)
+    except:
+        return src
+
+def parse_y_pred(ypred, anchors, class_types, islist=False, threshold=0.2, nms_threshold=0):
+    try:
+        if not anchors or not class_types:
+            return [] if islist else None
+            
+        ceillen = 5 + len(class_types)
+        sigmoid = lambda x: 1/(1+math.exp(-x))
+        infos = []
+        
+        for idx in range(min(len(anchors), 3)):
+            try:
+                tensor_idx = 4 + idx * ceillen
+                if tensor_idx >= ypred.shape[3]:
+                    continue
+                
+                a = ypred[:, :, :, tensor_idx]
+                for ii, i in enumerate(a[0]):
+                    for jj, j in enumerate(i):
+                        infos.append((ii, jj, idx, sigmoid(float(j))))
+            except:
+                continue
+                
+        if not infos:
+            return [] if islist else None
+            
+        infos = sorted(infos, key=lambda i: -i[3])
+        
+        def get_xyxy_clz_con_emergency(info):
+            try:
+                gap = 416/ypred.shape[1]
+                x, y, idx, con = info
+                
+                if idx >= len(anchors):
+                    return None
+                    
+                gp = idx * ceillen
+                if (gp + 5 + len(class_types)) > ypred.shape[3]:
+                    return None
+                    
+                _np_sigmoid = lambda x: 1.0 / (1.0 + np.exp(-x))
+                pred_xy = _np_sigmoid(ypred[0, x, y, gp + 0:gp + 2])
+                pred_wh = ypred[0, x, y, gp + 2:gp + 4]
+                pred_clz = ypred[0, x, y, gp + 5:gp + 5 + len(class_types)]
+
+                exp = math.exp
+                cx, cy = float(pred_xy[0]), float(pred_xy[1])
+                rx, ry = (cx + x) * gap, (cy + y) * gap
+                rw, rh = float(pred_wh[0]), float(pred_wh[1])
+                rw, rh = exp(rw) * anchors[idx][0], exp(rh) * anchors[idx][1]
+                clz_ = [float(c) for c in pred_clz]
+                xx = rx - rw / 2
+                _x = rx + rw / 2
+                yy = ry - rh / 2
+                _y = ry + rh / 2
+
+                log_cons = _np_sigmoid(ypred[:, :, :, gp + 4])
+                log_cons = np.transpose(log_cons, (0, 2, 1))
+                
+                clz = 'unknown'
+                if clz_:
+                    max_val = max(clz_)
+                    max_idx = clz_.index(max_val)
+                    for key, value in class_types.items():
+                        if value == max_idx:
+                            clz = key
+                            break
+                            
+                return [xx, yy, _x, _y], clz, con, log_cons
+            except:
+                return None
+        
+        if islist:
+            limited_infos = infos[:min(50, len(infos))]
+            v = []
+            for i in limited_infos:
+                if i[3] > threshold:
+                    result = get_xyxy_clz_con_emergency(i)
+                    if result is not None:
+                        v.append(result)
+            return v
+        else:
+            if infos:
+                return get_xyxy_clz_con_emergency(infos[0])
+            return None
+    except Exception as e:
+        return [] if islist else None
+
+# PyTorch Mini class removed, inference logic baked into net.onnx
+
+def get_clz_rect_from_image(image_data, state):
+    try:
+        if not state or 'session' not in state:
+            return [], None
+
+        session = state['session']
+        anchors = state.get('anchors', [])
+        class_types = state.get('class_types', {})
+        input_name = state.get('input_name', 'input')
+        output_name = state.get('output_name', 'output')
+
+        if not anchors or not class_types:
+            return [], None
+
+        image_array = np.frombuffer(image_data, dtype=np.uint8)
+        npimg = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        if npimg is None:
+            return [], None
+
+        height, width = npimg.shape[:2]
+        npimg = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
+        npimg = cv2.resize(npimg, (416, 416), interpolation=cv2.INTER_LINEAR)
+        npimg_ = np.transpose(npimg, (2, 1, 0))
+
+        input_np = np.expand_dims(npimg_, 0).astype(np.float32)
+        y_pred = session.run([output_name], {input_name: input_np})[0]
+
+        v = parse_y_pred(y_pred, anchors, class_types, islist=True, threshold=0.2, nms_threshold=0.4)
+        ret = []
+        
+        for i in v:
+            if len(i) >= 4:
+                rect, clz, con, log_cons = i[0], i[1], i[2], i[3]
+                rw, rh = width/416, height/416
+                rect[0] = int(rect[0]*rw)
+                rect[2] = int(rect[2]*rw)
+                rect[1] = int(rect[1]*rh)
+                rect[3] = int(rect[3]*rh)
+                ret.append([clz, rect])
+                
+        return ret, npimg
+    except:
+        return [], None
+
+def get_cut_img(npimg, rects):
+    ret = []
+    try:
+        for item in rects:
+            if len(item) >= 2:
+                clz, rect = item[0], item[1]
+                if len(rect) >= 4:
+                    x1, y1, x2, y2 = rect[0], rect[1], rect[2], rect[3]
+                    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(npimg.shape[1], x2), min(npimg.shape[0], y2)
+                    if x2 > x1 and y2 > y1:
+                        ret.append([clz, npimg[y1:y2,x1:x2,:], (x1,y1,x2,y2)])
+    except:
+        pass
+    return ret
+
+# Global resources for SIFT/hybrid ONNX model
+_model_state = None
+_model_lock = threading.Lock()
+
+def initialize_global_model():
+    global _model_state
+    if _model_state is not None:
+        return _model_state
+
+    with _model_lock:
+        if _model_state is not None:
+            return _model_state
+
+        onnx_path = os.path.join(DIR_PATH, 'net.onnx')
+        meta_path = os.path.join(DIR_PATH, 'net_meta.json')
+
+        if not os.path.exists(onnx_path) or not os.path.exists(meta_path):
+            logger.warning("net.onnx or net_meta.json not found, Type 7 solver disabled.")
+            return None
+
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.enable_mem_pattern   = True
+            so.enable_cpu_mem_arena = True
+            session = ort.InferenceSession(
+                onnx_path,
+                sess_options=so,
+                providers=['CPUExecutionProvider'],
+            )
+
+            class_types_raw = meta.get('class_types') or {}
+            class_types = {k: int(v) if isinstance(v, (int, float)) else v
+                           for k, v in class_types_raw.items()}
+
+            _model_state = {
+                'session': session,
+                'anchors': [tuple(a) for a in meta.get('anchors', [])],
+                'class_types': class_types,
+                'input_name': meta.get('input_name', 'input'),
+                'output_name': meta.get('output_name', 'output'),
+            }
+            logger.info("ONNX Type 7 model loaded successfully")
+            return _model_state
+        except Exception as e:
+            logger.error(f"Failed to load ONNX Type 7 model: {e}")
+            return None
+
+def get_global_model():
+    global _model_state
+    if _model_state is None:
+        return initialize_global_model()
+    return _model_state
+
+# Sift Detector
+_sift_detector = None
+_sift_lock = threading.Lock()
+
+def get_sift_detector():
+    global _sift_detector
+    if _sift_detector is None:
+        with _sift_lock:
+            if _sift_detector is None:
+                try:
+                    _sift_detector = cv2.SIFT_create(nfeatures=50, contrastThreshold=0.08)
+                except AttributeError:
+                    try:
+                        _sift_detector = cv2.xfeatures2d.SIFT_create(nfeatures=50, contrastThreshold=0.08)
+                    except AttributeError:
+                        _sift_detector = cv2.ORB_create(nfeatures=50)
+    return _sift_detector
+
+def get_flags_rects_from_image(image_data, state):
+    try:
+        if state is None:
+            return None, None, None
+            
+        image_array = np.frombuffer(image_data, dtype=np.uint8)
+        s = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        
+        if s is None or s.size == 0:
+            return None, None, None
+        
+        height, width = s.shape[:2]
+        if height < 200 or width < 84:
+            return None, None, None
+            
+        try:
+            end_height = min(height, s.shape[0])
+            a = s[160:end_height, 0:min(22, width), :]
+            b = s[160:end_height, 28:min(50, width), :]
+            c = s[160:end_height, 56:min(78, width), :]
+            
+            if a.shape[0] < 40 or a.shape[1] < 20:
+                return None, None, None
+                
+            a1 = a[40:min(60, a.shape[0]), :, :] if a.shape[0] > 40 else a
+            a2 = a[0:min(20, a.shape[0]), :, :] if a.shape[0] > 0 else a
+            b1 = b[40:min(60, b.shape[0]), :, :] if b.shape[0] > 40 else b
+            b2 = b[0:min(20, b.shape[0]), :, :] if b.shape[0] > 0 else b
+            c1 = c[40:min(60, c.shape[0]), :, :] if c.shape[0] > 40 else c
+            c2 = c[0:min(20, c.shape[0]), :, :] if c.shape[0] > 0 else c
+        except:
+            return None, None, None
+        
+        def get_match_lens_emergency(i1, i2):
+            try:
+                if i1.size == 0 or i2.size == 0: return 0
+                i1 = cv2.resize(i1, (min(i1.shape[1]*4, 800), min(i1.shape[0]*4, 600)), interpolation=cv2.INTER_LINEAR)
+                i2 = cv2.resize(i2, (min(i2.shape[1]*2, 400), min(i2.shape[0]*2, 300)), interpolation=cv2.INTER_LINEAR)
+                
+                sift = get_sift_detector()
+                kp1, des1 = sift.detectAndCompute(i1, None)
+                kp2, des2 = sift.detectAndCompute(i2, None)
+                
+                if des1 is None or des2 is None or len(des1) == 0 or len(des2) == 0: return 0
+                
+                bf = cv2.BFMatcher()
+                matches = bf.knnMatch(des1, des2, k=2)
+                good = 0
+                for match_pair in matches:
+                    if len(match_pair) >= 2:
+                        m, n = match_pair[0], match_pair[1]
+                        if m.distance <= 0.88 * n.distance:
+                            good += 1
+                return good
+            except:
+                return 0
+        
+        def get_flag_rect_emergency(k12, cut_imgs, st):
+            try:
+                if len(k12) < 2: return []
+                k1, k2 = k12[0], k12[1]
+                r = []
+                for item in cut_imgs:
+                    if len(item) >= 3:
+                        clz, npimg, rect = item[0], item[1], item[2]
+                        if clz == '1':
+                            r1 = get_match_lens_emergency(k1, npimg)
+                            r.append([r1, rect, st])
+                        elif clz == '2':
+                            r2 = get_match_lens_emergency(k2, npimg)
+                            r.append([r2, rect, st])
+                return sorted(r, key=lambda i: i[0]) if r else []
+            except:
+                return []
+        
+        try:
+            rects, processed_img = get_clz_rect_from_image(image_data, state)
+            if not rects: return None, None, None
+            
+            v = get_cut_img(s, rects)
+            if len(v) == 0: return None, None, None
+            
+            rs1 = get_flag_rect_emergency([a1, a2], v, 1)
+            rs2 = get_flag_rect_emergency([b1, b2], v, 2)
+            rs3 = get_flag_rect_emergency([c1, c2], v, 3)
+            rs = rs1 + rs2 + rs3
+            
+            if len(rs) < 3: return None, None, None
+            
+            r = []
+            used_types = set()
+            for target_type in [1, 2, 3]:
+                candidates = [x for x in rs if len(x) >= 3 and x[2] == target_type]
+                if candidates:
+                    best = max(candidates, key=lambda x: x[0])
+                    r.append(best)
+                    used_types.add(target_type)
+                    
+            if len(r) >= 3:
+                r = sorted(r[:3], key=lambda x: x[2])
+                return r[0][1], r[1][1], r[2][1]
+            else:
+                return None, None, None
+        except Exception as e:
+            return None, None, None
+    except Exception as e:
+        return None, None, None
+
+class _PyDun163Ctx:
+    """PyExecJS-shaped wrapper around `dun163_py`.
+
+    Exposes a `.call(name, *args)` method so it can be assigned directly
+    to `AsyncDun163.ctx` -- the rest of the class then uses it through
+    `self.ctx.call(...)` exactly as if it were an execjs context.
+
+    All entry points are byte-for-byte verified by
+    `test_dun163_port.py` (258/258).
+    """
+
+    __slots__ = ("_module",)
+
+    def __init__(self):
+        self._module = dun163_py
+
+    def call(self, name, *args):
+        fn = getattr(self._module, name, None)
+        if fn is None:
+            raise AttributeError(
+                f"dun163_py has no attribute {name!r}; "
+                "if dun163.js was rotated, re-run extract_dun163_constants.py "
+                "and add the missing function to dun163_py."
+            )
+        return fn(*args)
+
+
+_py_dun163_ctx_singleton = None
+
+
+def _get_py_dun163_ctx():
+    global _py_dun163_ctx_singleton
+    if _py_dun163_ctx_singleton is None:
+        _py_dun163_ctx_singleton = _PyDun163Ctx()
+    return _py_dun163_ctx_singleton
+
+
+def get_compiled_js(file_name):
+    """Kept for AsyncDun163 compatibility. Always returns the Python ctx."""
+    return _get_py_dun163_ctx()
+
+# API Solver
+_api_solver = None
+_api_solver_lock = threading.Lock()
+
+def get_api_solver():
+    global _api_solver
+    if _api_solver is None:
+        with _api_solver_lock:
+            if _api_solver is None:
+                try:
+                    kwargs = dict(use_gpu=USE_GPU_SOLVER)
+                    if SOLVER_MODEL_PATH:
+                        kwargs['model_path'] = SOLVER_MODEL_PATH
+                    if USE_ONNX_SOLVER:
+                        _api_solver = APIImageSolverONNX(use_fp16=USE_FP16_MODEL, use_int8=USE_INT8_MODEL, **kwargs)
+                    else:
+                        if APIImageSolver is None:
+                            logger.warning("PyTorch solver (APIImageSolver) is not available. Falling back to APIImageSolverONNX.")
+                            _api_solver = APIImageSolverONNX(use_fp16=USE_FP16_MODEL, use_int8=USE_INT8_MODEL, **kwargs)
+                        else:
+                            _api_solver = APIImageSolver(use_fp16=USE_GPU_SOLVER, **kwargs)
+                except Exception as e:
+                    logger.error(f"Failed to initialize solver: {e}")
+                    _api_solver = None
+    return _api_solver
+
+# ============ ASYNC DUN163 CLASS ============
+
+class AsyncDun163:
+    def __init__(self, id_, *, referer, fp_h, ua, thread_id, domain=None, session=None, executor=None):
+        self.id_ = id_
+        self.referer = referer
+        self.fp_h = fp_h
+        self.ua = ua
+        self.thread_id = thread_id
+        self.domain = domain if domain else random.choice(DUN163_DOMAINS)
+        self.session = session
+        self.executor = executor
+        self.request_params = {
+            'id': id_,
+            'referer': referer,
+            'fp_h': fp_h,
+            'ua': ua
+        }
+        self.fp = None
+        # JS context is loaded once and cached, thread-safe for basic calls usually, but if not we run in executor
+        self.ctx = get_compiled_js('dun163.js') 
+
+    async def get_jsonp(self, text):
+        return await asyncio.get_running_loop().run_in_executor(self.executor, self._get_jsonp_sync, text)
+
+    @staticmethod
+    def _get_jsonp_sync(text):
+        try:
+            jsonp_str = re.search(r"\((.*)\)", text, re.S)
+            if jsonp_str:
+                return json.loads(jsonp_str.group(1))
+            return {}
+        except:
+            return {}
+
+    def random_jsonp_str(self):
+        s = string.ascii_lowercase + string.digits
+        text = ''.join(random.choices(s, k=7))
+        return "__JSONP_" + text + '_'
+
+    async def run_js(self, func_name, *args):
+        if not self.ctx: return None
+        return await asyncio.get_running_loop().run_in_executor(self.executor, self.ctx.call, func_name, *args)
+
+    async def request_with_retry(self, method, url, retry_count=3, **kwargs):
+        timeout = kwargs.pop('timeout', aiohttp.ClientTimeout(total=5))
+        if isinstance(timeout, (int, float)):
+             timeout = aiohttp.ClientTimeout(total=timeout)
+        
+        headers = {
+            "User-Agent": self.ua,
+            "Referer": self.referer,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if 'headers' in kwargs:
+            headers.update(kwargs['headers'])
+            del kwargs['headers']
+
+        for attempt in range(retry_count):
+            try:
+                # We do not use the 'params' argument of aiohttp like requests if we want exact control, 
+                # but aiohttp handles params well.
+                async with self.session.request(method, url, headers=headers, timeout=timeout, **kwargs) as response:
+                    response.raise_for_status()
+                    return await response.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(0.1)
+                else:
+                    return None
+        return None
+
+    async def request_getconf(self):
+        try:
+            url = self.domain + '/api/v2/getconf'
+            params = {
+                "referer": self.request_params['referer'],
+                "zoneId": "", "dt": "", "id": self.request_params['id'],
+                "ipv6": "false", "runEnv": "10", "iv": "5",
+                "loadVersion": "2.5.3", "lang": "en-US",
+                "callback": self.random_jsonp_str() + '0'
+            }
+            text = await self.request_with_retry('get', url, params=params)
+            if not text: return {}
+            resp_json = await self.get_jsonp(text)
+            return resp_json.get('data', {})
+        except:
+            return {}
+
+    async def request_get(self, dt, bid, ac_token, ir_token=None):
+        try:
+            url = self.domain + '/api/v3/get'
+            
+            fp = await self.run_js('get_fp', self.request_params['fp_h'], self.request_params['ua'])
+            cb = await self.run_js('get_cb')
+            self.fp = fp
+            
+            params = {
+                "referer": self.request_params['referer'],
+                "zoneId": "CN31", "dt": dt, "id": bid, "fp": fp,
+                "https": "true", "type": "", "version": "2.28.5",
+                "dpr": "1", "dev": "1", "cb": cb, "ipv6": "false",
+                "runEnv": "10", "group": "", "scene": "", "lang": "en-US",
+                "sdkVersion": "", "loadVersion": "2.5.3", "iv": "4",
+                "user": "", "width": "320", "audio": "false",
+                "sizeType": "10", "smsVersion": "v3", "token": "",
+                "callback": self.random_jsonp_str() + '0'
+            }
+            if ir_token: params["irToken"] = ir_token
+            
+            text = await self.request_with_retry('get', url, params=params)
+            if not text: return {}
+            resp_json = await self.get_jsonp(text)
+            return resp_json.get('data', {})
+        except:
+            return {}
+
+    async def request_check(self, dt, bid, *, token, captcha_type=7, click_data=None, color_click_point=None):
+        try:
+            url = self.domain + '/api/v3/check'
+            
+            if captcha_type == 7 and click_data:
+                check_data = await self.run_js('get_click_check_data', click_data, token)
+            elif captcha_type == 11 and color_click_point:
+                check_data = await self.run_js('get_color_click_check_data', color_click_point, token)
+            else:
+                check_data = '{"d":"","m":"","p":"","ext":""}'
+            
+            cb = await self.run_js('get_cb')
+            
+            params = {
+                "referer": self.request_params['referer'],
+                "zoneId": "CN31", "dt": dt, "id": bid,
+                "fp": self.fp, "https": "true",
+                "type": str(captcha_type), "version": "2.29.12",
+                "dpr": "1", "dev": "1", "cb": cb, "ipv6": "false",
+                "runEnv": "10", "group": "", "scene": "", "lang": "en-US",
+                "sdkVersion": "", "loadVersion": "2.5.3", "iv": "5",
+                "user": "", "width": "320", "audio": "false",
+                "sizeType": "10", "smsVersion": "v3",
+                "token": token, "data": check_data,
+                "callback": self.random_jsonp_str() + '1'
+            }
+            
+            text = await self.request_with_retry('get', url, params=params)
+            if not text: return {}
+            resp_json = await self.get_jsonp(text)
+            return resp_json.get('data', {})
+        except:
+            return {}
+
+    async def handle_click_captcha_hybrid(self, bg_url, token):
+        try:
+            # Download image (pure async I/O — no semaphore needed here)
+            async with self.session.get(bg_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200: return self.generate_emergency_clicks()
+                image_data = await resp.read()
+
+            click_points = await asyncio.get_running_loop().run_in_executor(
+                self.executor, self._process_image_sync, image_data
+            )
+            return click_points
+        except:
+            return self.generate_emergency_clicks()
+
+    def _process_image_sync(self, image_data):
+        state = get_global_model()
+        if not state: return self.generate_emergency_clicks()
+        
+        rects = get_flags_rects_from_image(image_data, state)
+        
+        rect1 = safe_list_access(rects, 0)
+        rect2 = safe_list_access(rects, 1)
+        rect3 = safe_list_access(rects, 2)
+        
+        if rect1 is not None and rect2 is not None and rect3 is not None:
+            click_points = []
+            for rect in [rect1, rect2, rect3]:
+                if rect and len(rect) >= 4:
+                    x1, y1, x2, y2 = rect[0], rect[1], rect[2], rect[3]
+                    center_x = int((x1 + x2) / 2)
+                    center_y = int((y1 + y2) / 2)
+                    offset_x = random.randint(-1, 1)
+                    offset_y = random.randint(-1, 1)
+                    final_x = max(5, min(center_x + offset_x, 315))
+                    final_y = max(5, min(center_y + offset_y, 195))
+                    click_points.append({"x": final_x, "y": final_y})
+            if len(click_points) >= 3:
+                return click_points[:3]
+        return self.generate_emergency_clicks()
+
+    def generate_emergency_clicks(self):
+        try:
+            patterns = [
+                [(80, 70), (160, 120), (240, 90)],
+                [(70, 100), (160, 95), (250, 105)],
+                [(160, 60), (110, 130), (210, 140)],
+            ]
+            selected_pattern = random.choice(patterns)
+            click_points = []
+            for x, y in selected_pattern:
+                offset_x = random.randint(-5, 5)
+                offset_y = random.randint(-5, 5)
+                final_x = max(15, min(x + offset_x, 305))
+                final_y = max(15, min(y + offset_y, 185))
+                click_points.append({"x": final_x, "y": final_y})
+            return click_points
+        except:
+            return [{"x": 80, "y": 70}, {"x": 160, "y": 120}, {"x": 240, "y": 90}]
+
+    async def handle_color_click_captcha(self, resp_get_data, token):
+        try:
+            solver = get_api_solver()
+            if not solver: return None
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                self.executor, solver.solve_captcha_from_api, resp_get_data
+            )
+
+            if result['success']:
+                return {
+                    'x': int(result['click_coordinates']['x']),
+                    'y': int(result['click_coordinates']['y'])
+                }
+            else:
+                return None
+        except:
+            return None
+
+    async def run(self, irToken=None, use_persistent_session=True):
+        if not use_persistent_session:
+            try:
+                self.ua = UserAgent().random
+                self.request_params['ua'] = self.ua
+            except Exception:
+                pass  # fake_useragent transient failure -> keep last UA
+
+            connector = aiohttp.TCPConnector(limit=1, ssl=False, enable_cleanup_closed=True)
+            session_headers = {
+                "User-Agent": self.ua,
+                "X-Forwarded-For": generate_random_ip(),
+                "X-Real-IP": generate_random_ip(),
+            }
+
+            async with aiohttp.ClientSession(connector=connector, headers=session_headers) as session:
+                self.session = session
+                return await self._run_solve(irToken)
+        else:
+            return await self._run_solve(irToken)
+
+    async def _run_solve(self, irToken=None):
+        try:
+            get_conf_data = await self.request_getconf()
+            if not get_conf_data: return False
+
+            dt = get_conf_data.get('dt')
+            ac_data = get_conf_data.get('ac', {})
+            ac_token = ac_data.get('token')
+            bid = ac_data.get('bid')
+
+            current_ir_token = irToken
+            if not current_ir_token:
+                ir_data = get_conf_data.get('ir', {})
+                if ir_data.get('enable'):
+                    current_ir_token = ir_data.get('token')
+
+            get_data = await self.request_get(dt, bid, ac_token, current_ir_token)
+            if not get_data: return False
+
+            captcha_type = get_data.get('type', 7)
+            token = get_data.get('token')
+            if not token: return False
+
+            if captcha_type == 7:
+                bg_urls = get_data.get('bg', [])
+                if not bg_urls: return False
+                click_points = await self.handle_click_captcha_hybrid(bg_urls[0], token)
+                resp_json = await self.request_check(dt, bid, token=token, captcha_type=7, click_data=click_points)
+            elif captcha_type == 11:
+                color_click_point = await self.handle_color_click_captcha(get_data, token)
+                if not color_click_point: return False
+                resp_json = await self.request_check(dt, bid, token=token, captcha_type=11, color_click_point=color_click_point)
+            else:
+                return False
+
+            if resp_json.get('result') == True:
+                validate_raw = resp_json.get('validate', '')
+                if validate_raw:
+                    validate_decoded = await self.run_js('do_onVerify', validate_raw, self.fp)
+                    if validate_decoded and len(validate_decoded.strip()) > 10:
+                        return validate_decoded
+            return False
+
+        except Exception as e:
+            return False
+
+# ============ WORKER & MAIN ============
+start_time = None
+token_counter = 0
+global_use_persistent_session = True
+
+# Rolling TPM: stores timestamps of recent successful solves within a sliding window
+import collections
+_tpm_window_seconds = 60  # rolling window size
+_tpm_timestamps = collections.deque()  # deque of float timestamps
+_tpm_lock = threading.Lock()
+
+def record_token_and_get_tpm():
+    """Thread-safe: record a solve timestamp and return the rolling TPM."""
+    global token_counter
+    now = time.time()
+    cutoff = now - _tpm_window_seconds
+    with _tpm_lock:
+        token_counter += 1
+        _tpm_timestamps.append(now)
+        # Trim expired entries from the left
+        while _tpm_timestamps and _tpm_timestamps[0] < cutoff:
+            _tpm_timestamps.popleft()
+        rolling_count = len(_tpm_timestamps)
+        count_snapshot = token_counter
+    # rolling_count solves happened within the last _tpm_window_seconds seconds
+    tpm = rolling_count * (60.0 / _tpm_window_seconds)
+    return count_snapshot, tpm
+
+def sqlite_worker():
+    """Background thread to save tokens to local SQLite database."""
+    if not sqlite_enabled:
+        return
+
+    try:
+        conn = sqlite3.connect(sqlite_db_path, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        print(f"✅ SQLite connection established (db={sqlite_db_path})")
+    except Exception as e:
+        print(f"❌ SQLite connection error: {e}")
+        return
+
+    batch = []
+    last_flush = time.time()
+    last_cleanup = time.time()
+
+    while True:
+        try:
+            try:
+                wait_timeout = 0.5 if len(batch) > 0 else 5.0
+                token_data = sqlite_queue.get(timeout=wait_timeout)
+                batch.append((token_data['token'], token_data['created_at']))
+                sqlite_queue.task_done()
+            except queue.Empty:
+                pass
+
+            current_time = time.time()
+            if len(batch) >= 50 or (len(batch) > 0 and current_time - last_flush > 0.5):
+                try:
+                    cursor.executemany('INSERT INTO tokens (token, created_at) VALUES (?, ?)', batch)
+                    conn.commit()
+                    batch = []
+                    last_flush = current_time
+                except Exception as e:
+                    print(f"SQLite insert error: {e}")
+                    batch = []
+
+            # Cleanup expired tokens every 10 seconds
+            if current_time - last_cleanup > 10.0:
+                try:
+                    cursor.execute("DELETE FROM tokens WHERE created_at < datetime('now', '-10 minutes')")
+                    conn.commit()
+                    last_cleanup = current_time
+                except Exception as e:
+                    pass
+
+        except Exception as e:
+            print(f"SQLite worker error: {e}")
+            time.sleep(1)
+
+async def handle_get_token(request):
+    if not sqlite_enabled:
+        return web.json_response({"success": False, "message": "SQLite storage not enabled"})
+    try:
+        conn = sqlite3.connect(sqlite_db_path, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, token FROM tokens ORDER BY created_at DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            cursor.execute("DELETE FROM tokens WHERE id = ?", (row[0],))
+            conn.commit()
+            return web.json_response({"success": True, "token": row[1]})
+        else:
+            return web.json_response({"success": False, "message": "No tokens available"})
+    except Exception as e:
+        return web.json_response({"success": False, "message": str(e)})
+
+async def start_api_server(port):
+    app = web.Application()
+    app.add_routes([web.get('/get_token', handle_get_token)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', port)
+    await site.start()
+    print(f"✅ API Server running on http://127.0.0.1:{port}/get_token")
+
+def mongo_worker():
+    """Background thread to save CN31 tokens to MongoDB (batched)."""
+    global mongo_collection
+    if not mongo_enabled:
+        return
+
+    if MongoClient is None:
+        print("❌ pymongo is not installed. Run `pip install pymongo` to use MongoDB storage.")
+        return
+
+    try:
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+        db = client[mongo_db_name]
+        mongo_collection = db[mongo_collection_name]
+        # Ensure TTL index exists (idempotent -- safe to call on every start)
+        mongo_collection.create_index(
+            "created_at",
+            expireAfterSeconds=mongo_ttl_seconds,
+            background=True,
+        )
+        print(f"✅ MongoDB connection established (db={mongo_db_name}, collection={mongo_collection_name}, TTL={mongo_ttl_seconds}s)")
+    except Exception as e:
+        print(f"❌ MongoDB connection error: {e}")
+        return
+
+    batch = []
+    last_flush = time.time()
+
+    while True:
+        try:
+            try:
+                wait_timeout = 0.5 if len(batch) > 0 else 5.0
+                token_data = mongo_queue.get(timeout=wait_timeout)
+                batch.append(token_data)
+                mongo_queue.task_done()
+            except queue.Empty:
+                pass
+
+            current_time = time.time()
+            if len(batch) >= 50 or (len(batch) > 0 and current_time - last_flush > 0.5):
+                try:
+                    mongo_collection.insert_many(batch, ordered=False)
+                    batch = []
+                    last_flush = current_time
+                except Exception as e:
+                    print(f"MongoDB insert error: {e}")
+                    # Fallback to file
+                    try:
+                        tokens_path = 'tokens_async.txt'
+                        with open(tokens_path, 'a', encoding='utf-8') as f:
+                            for td in batch:
+                                try:
+                                    f.write(f"{td['token']}\n")
+                                except:
+                                    pass
+                    except:
+                        pass
+                    batch = []
+
+        except Exception as e:
+            print(f"MongoDB worker error: {e}")
+            time.sleep(1)
+
+async def async_redis_worker():
+    """Background worker to save tokens to Redis"""
+    global redis_client
+    if not redis_enabled:
+        return
+
+    try:
+        # BlockingConnectionPool: workers wait their turn for a free connection
+        # instead of getting "Too many connections". Cap kept well under Redis
+        # Cloud's free-tier 30-client limit (producer uses ~4 separately).
+        pool = redis.BlockingConnectionPool(
+            host=redis_host,
+            port=redis_port,
+            username=redis_username,
+            password=redis_password,
+            decode_responses=True,
+            max_connections=20,
+            timeout=10,  # seconds to wait for a free connection
+        )
+        redis_client = redis.Redis(connection_pool=pool)
+        await redis_client.ping()
+        print(f"✅ Redis connection established (pool=20, blocking)")
+    except Exception as e:
+        print(f"❌ Redis connection error: {e}")
+        return
+
+    batch = []
+    last_flush = time.time()
+    
+    while True:
+        try:
+            # Collect items with timeout
+            try:
+                # If we have a batch, wait less
+                timeout = 0.5 if len(batch) > 0 else 5.0
+                token_data = await asyncio.wait_for(redis_queue.get(), timeout=timeout)
+                batch.append(token_data)
+                redis_queue.task_done()
+            except asyncio.TimeoutError:
+                pass
+            
+            # Flush if batch full or timeout
+            current_time = time.time()
+            if len(batch) >= 50 or (len(batch) > 0 and current_time - last_flush > 0.5):
+                try:
+                    async with redis_client.pipeline(transaction=False) as pipe:
+                        for td in batch:
+                            pipe.rpush(redis_token_list, td)
+                        pipe.incrby(redis_token_saved_count, len(batch))
+                        await pipe.execute()
+                    batch = []
+                    last_flush = current_time
+                except Exception as e:
+                    print(f"Redis pipeline error: {e}")
+                    # Fallback to file? logic here or just dropping for high throughput
+                    # For now we just print error, maybe save to file as backup
+                    async with aiofiles.open('tokens_async.txt', 'a') as f:
+                         for td in batch:
+                             try:
+                                 t_obj = json.loads(td)
+                                 await f.write(f"{t_obj['token']}\n")
+                             except: pass
+                    batch = []
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Redis worker error: {e}")
+            await asyncio.sleep(1)
+
+EXPIRED_CLEANUP_INTERVAL = 10  # Check every 10 seconds (cheap operation)
+
+async def async_redis_cleanup_worker():
+    """Background worker to trim expired tokens from the front of the Redis list.
+    Since tokens are rpush'd chronologically, expired ones are always at the head.
+    We just lpop until we hit a valid token — O(k) where k = expired count."""
+    global redis_client
+    if not redis_enabled:
+        return
+
+    while redis_client is None:
+        await asyncio.sleep(2)
+
+    while True:
+        try:
+            await asyncio.sleep(EXPIRED_CLEANUP_INTERVAL)
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+            expired_count = 0
+
+            while True:
+                # Peek at the front item without removing
+                item = await redis_client.lindex(redis_token_list, 0)
+                if not item:
+                    break  # List is empty
+
+                try:
+                    t_obj = json.loads(item)
+                    expiry_str = t_obj.get("time_expired", "")
+                    if not expiry_str:
+                        break  # No expiry info, leave it
+                    expiry_dt = datetime.datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+                    if expiry_dt <= now:
+                        # Expired — pop it off
+                        await redis_client.lpop(redis_token_list)
+                        expired_count += 1
+                    else:
+                        break  # Front token is still valid, everything behind it is newer
+                except (json.JSONDecodeError, ValueError, KeyError):
+                    # Malformed entry, remove it
+                    await redis_client.lpop(redis_token_list)
+                    expired_count += 1
+
+            if expired_count > 0:
+                logger.info(f"Cleaned up {expired_count} expired tokens from Redis")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Redis cleanup worker error: {e}")
+            await asyncio.sleep(5)
+
+# Dedicated executor for JS and image-processing work.
+_shared_executor = ThreadPoolExecutor(max_workers=16)
+
+SESSION_RECYCLE_INTERVAL = 300  # Recreate session every 5 minutes
+SOLVER_TIMEOUT = 30  # Timeout for a single solve attempt
+
+async def async_worker(worker_id, config, ir_token):
+    global token_counter, start_time
+
+    if not global_use_persistent_session:
+        # Old mode: fresh session per solve, flat simple loop
+        solver = AsyncDun163(
+            id_=config['ID_'],
+            referer=config['REFERER'],
+            fp_h=config['FP_H'],
+            ua=config['UA'],
+            thread_id=worker_id,
+            domain=config['DOMAIN'],
+            session=None,
+            executor=_shared_executor,
+        )
+        while True:
+            try:
+                try:
+                    token = await asyncio.wait_for(
+                        solver.run(irToken=ir_token if USE_IRTOKEN else None, use_persistent_session=False),
+                        timeout=SOLVER_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Worker {worker_id}: solve timed out")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if token:
+                    # Rolling TPM Calculation
+                    count_snapshot, tpm = record_token_and_get_tpm()
+                    print(f"[{count_snapshot}-{tpm:.1f}/min] {token}")
+
+                    if redis_enabled and redis_client:
+                        # Redis save
+                        expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+                        token_data = json.dumps({
+                            "token": token,
+                            "time_expired": expiry,
+                        })
+                        redis_queue.put_nowait(token_data)
+                    elif mongo_enabled:
+                        # MongoDB save
+                        token_data = {
+                            "token": token,
+                            "created_at": datetime.datetime.now(datetime.timezone.utc),
+                        }
+                        mongo_queue.put_nowait(token_data)
+                    elif sqlite_enabled:
+                        # SQLite save
+                        token_data = {
+                            "token": token,
+                            "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                        sqlite_queue.put_nowait(token_data)
+                    else:
+                        # File save
+                        async with aiofiles.open('tokens_async.txt', 'a') as f:
+                            await f.write(f'{token}\n')
+
+                await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"Worker {worker_id} error: {e}")
+                await asyncio.sleep(1)
+    else:
+        # New mode: persistent/pooled session recycled periodically
+        while True:  # Outer restart loop
+            connector = aiohttp.TCPConnector(limit=1, ssl=False, enable_cleanup_closed=True)
+            
+            headers = {
+                "User-Agent": config['UA'],
+                "X-Forwarded-For": generate_random_ip(),
+                "X-Real-IP": generate_random_ip(),
+            }
+
+            try:
+                async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+                    solver = AsyncDun163(
+                        id_=config['ID_'],
+                        referer=config['REFERER'],
+                        fp_h=config['FP_H'],
+                        ua=config['UA'],
+                        thread_id=worker_id,
+                        domain=config['DOMAIN'],
+                        session=session,
+                        executor=_shared_executor,
+                    )
+
+                    session_start = time.time()
+                    consecutive_failures = 0
+
+                    while True:
+                        # Recreate session periodically to avoid stale connections
+                        if time.time() - session_start > SESSION_RECYCLE_INTERVAL:
+                            logger.debug(f"Worker {worker_id}: recycling session due to age")
+                            break  # Break inner loop to recreate session
+
+                        try:
+                            token = await asyncio.wait_for(
+                                solver.run(irToken=ir_token if USE_IRTOKEN else None, use_persistent_session=True),
+                                timeout=SOLVER_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Worker {worker_id}: solve timed out")
+                            consecutive_failures += 1
+                            if consecutive_failures > 10:
+                                logger.warning(f"Worker {worker_id}: too many consecutive failures, recycling session")
+                                break
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        if token:
+                            consecutive_failures = 0
+                            # Rolling TPM Calculation
+                            count_snapshot, tpm = record_token_and_get_tpm()
+
+                            if count_snapshot >= 20000:
+                                print(f"[{count_snapshot}-{tpm:.1f}/min] {token}")
+                                print(f"[-] Reached 20,000 solved CAPTCHAs on worker {worker_id}. Restarting session...")
+                                with _tpm_lock:
+                                    token_counter = 0
+                                    _tpm_timestamps.clear()
+                                break  # Break inner loop → outer loop creates a fresh aiohttp session
+
+                            print(f"[{count_snapshot}-{tpm:.1f}/min] {token}")
+
+                            if redis_enabled and redis_client:
+                                # Redis save
+                                expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+                                token_data = json.dumps({
+                                    "token": token,
+                                    "time_expired": expiry,
+                                })
+                                redis_queue.put_nowait(token_data)
+                            elif mongo_enabled:
+                                # MongoDB save
+                                token_data = {
+                                    "token": token,
+                                    "created_at": datetime.datetime.now(datetime.timezone.utc),
+                                }
+                                mongo_queue.put_nowait(token_data)
+                            elif sqlite_enabled:
+                                # SQLite save
+                                token_data = {
+                                    "token": token,
+                                    "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                                sqlite_queue.put_nowait(token_data)
+                            else:
+                                # File save
+                                async with aiofiles.open('tokens_async.txt', 'a') as f:
+                                    await f.write(f'{token}\n')
+                        else:
+                            consecutive_failures += 1
+                            if consecutive_failures >= 5:
+                                consecutive_failures = 0
+                                break  # recycle session
+
+                        await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"Worker {worker_id} error: {e}")
+                await asyncio.sleep(1)
+
+async def main():
+    global start_time, redis_enabled, mongo_enabled, global_use_persistent_session, sqlite_enabled
+    start_time = time.time()
+
+    import argparse
+    parser = argparse.ArgumentParser(description="MLBB Dun163 Async Captcha Solver")
+    parser.add_argument("--storage", choices=["1", "2", "3", "4"], help="Storage Mode: 1=Redis, 2=MongoDB, 3=File, 4=SQLite (ignored — always server-only)")
+    parser.add_argument("--session-mode", choices=["1", "2"], help="Session Mode: 1=Persistent Session (FAST), 2=Fresh Session per Solve (OLD/SLOW) (ignored — always 1)")
+    parser.add_argument("--api-port", type=int, help="Port for the SQLite API server (default: disabled)")
+    args = parser.parse_args()
+
+    # Hardcoded: always push ALL solved tokens to server only (Redis + MongoDB from config).
+    # Local file / SQLite are disabled so tokens stock only on the server.
+    redis_enabled = True
+    mongo_enabled = True
+    sqlite_enabled = False
+    api_port = args.api_port  # kept for compatibility; SQLite path is off
+
+    print("=" * 60)
+    print("Storage Mode: SERVER ONLY (Redis + MongoDB)")
+    print(f"  Redis={redis_enabled}, MongoDB={mongo_enabled}, SQLite={sqlite_enabled}, File=False")
+    print("=" * 60)
+
+    # Hardcoded: always use Persistent Session Mode (1) — fastest connection pooling
+    global_use_persistent_session = True
+    print("Session Mode Configured: Persistent Session (Connection Pooling - Fast) [forced]")
+
+    # Initialize resources
+    print("Initializing resources...")
+    initialize_global_model()
+    print("dun163 backend: pure Python (dun163_py)")
+    # Touch the singleton so any import error surfaces here, not mid-solve.
+    _get_py_dun163_ctx()
+    
+    # Single irToken: fetch once at startup and reuse for every attempt
+    # across all workers. No pool, no Redis -- just one tk + fresh
+    # aiohttp.ClientSession per attempt (handled inside AsyncDun163.run).
+    irToken = None
+    if USE_IRTOKEN:
+        print("Fetching single irToken (used by all workers)...")
+        try:
+            irToken = await request_up()
+            if irToken:
+                print(f"irToken acquired: {irToken[:24]}...")
+            else:
+                print("request_up() returned no token; falling back to server-issued ir.token per attempt")
+        except Exception as e:
+            print(f"Failed to fetch irToken: {e} (falling back to server-issued ir.token per attempt)")
+
+    num_workers = 30 # High concurrency for async
+    print(f"Starting {num_workers} async workers...")
+    
+    config = {
+        'ID_': ID,
+        'REFERER': REFERER,
+        'FP_H': FP_H,
+        'UA': UserAgent().random,
+        'DOMAIN': DUN163_DOMAINS[0]
+    }
+    
+    redis_task = None
+    redis_cleanup_task = None
+    if redis_enabled:
+        print("Starting Redis worker...")
+        redis_task = asyncio.create_task(async_redis_worker())
+        redis_cleanup_task = asyncio.create_task(async_redis_cleanup_worker())
+
+    if mongo_enabled:
+        print("Starting MongoDB worker...")
+        import threading
+        threading.Thread(target=mongo_worker, daemon=True, name="mongo_worker").start()
+        
+    if sqlite_enabled:
+        print("Starting SQLite worker...")
+        import threading
+        threading.Thread(target=sqlite_worker, daemon=True, name="sqlite_worker").start()
+        if api_port:
+            print(f"Starting API Server on port {api_port}...")
+            asyncio.create_task(start_api_server(api_port))
+    
+    tasks = []
+    for i in range(num_workers):
+        worker_config = config.copy()
+        worker_config['UA'] = UserAgent().random
+        worker_config['DOMAIN'] = DUN163_DOMAINS[i % len(DUN163_DOMAINS)]
+        tasks.append(asyncio.create_task(async_worker(i, worker_config, irToken)))
+        
+    try:
+        await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        print("Stopping...")
+    finally:
+        if redis_task:
+            redis_task.cancel()
+        if redis_cleanup_task:
+            redis_cleanup_task.cancel()
+
+if __name__ == '__main__':
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())

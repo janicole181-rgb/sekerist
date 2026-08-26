@@ -1,0 +1,22 @@
+# Core CAPTCHA & Image Processing
+numpy>=1.21.0
+Pillow>=9.0.0
+opencv-python-headless>=4.5.0
+onnxruntime>=1.16.0
+
+# Web server
+flask>=3.0.0
+gunicorn>=21.2.0
+
+# Asynchronous HTTP & File Handling
+aiohttp>=3.8.0
+aiofiles>=3.8.0
+requests>=2.27.0
+
+# Logging & Utilities
+loguru>=0.6.0
+fake-useragent>=1.1.0
+
+# Database / Caching
+redis>=4.0.0
+pymongo>=4.0.0

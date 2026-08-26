@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep server.py running 24/7.
+# If it crashes or exits, restart it after 5 seconds.
+
+while true; do
+    echo "[$(date)] Starting server.py..."
+    python server.py
+
+    EXIT_CODE=$?
+    echo "[$(date)] server.py exited with code $EXIT_CODE."
+    echo "Restarting in 5 seconds..."
+    sleep 5
+done

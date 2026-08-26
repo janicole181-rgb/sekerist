@@ -1,0 +1,40 @@
+{
+    "proxy": {
+        "file_path": "proxy.txt",
+        "username": "adc0053cd3245c73065d",
+        "password": "dbb9351dd9f91954",
+        "use_auth": true
+    },
+    "threads": 100,
+    "retries": 0,
+    "tokens": {
+        "use_pre_fetched": true,
+        "file_path": "tokens.txt"
+    },
+    "solver": {
+        "use_onnx": true,
+        "use_gpu": false,
+        "use_fp16": false,
+        "use_int8": true,
+        "model": "yidun-yolov8n-cpu-int8.onnx",
+        "cpu_concurrency": 12,
+        "onnx_intra_threads": 4,
+        "onnx_inter_threads": 1,
+        "comment": "use_onnx: true=ONNX Runtime, false=PyTorch | use_gpu: true=GPU (requires onnxruntime-gpu) | use_fp16: GPU-only | use_int8: faster on CPU | model: null=default | cpu_concurrency: max parallel ONNX/SIFT tasks (set to your physical core count) | onnx_intra_threads: threads inside one ONNX op (2-4 sweet-spot) | onnx_inter_threads: independent ops parallelism (1=sequential)"
+    },
+    "redis": {
+        "enabled": true,
+        "host": "redis-15806.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com",
+        "port": 15806,
+        "username": "default",
+        "password": "x3hNzd2E5ANZKs9GeYV6ap83il634wc6",
+        "key_prefix": "mtoken:"
+    },
+    "mongodb": {
+        "enabled": true,
+        "uri": "mongodb+srv://j41a:72KEIi94jpyJoGom@cn31.iv8bazt.mongodb.net/",
+        "db": "yidun",
+        "collection": "cn31_tokens",
+        "ttl_seconds": 600
+    }
+}
