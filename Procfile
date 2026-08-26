@@ -1,0 +1,11 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "python server.py",
+    "healthcheckPath": "/health",
+    "restartPolicyType": "ON_FAILURE",
+    "multiPhase": true
+  }
+}
