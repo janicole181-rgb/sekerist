@@ -1,2 +1,3 @@
 #!/bin/bash
-python watchdog_solver.py --storage 2 --session-mode 1
+# Start the server - Flask mode
+python main.py
