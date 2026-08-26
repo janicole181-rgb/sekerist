@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 TOKEN_EXPIRY_SECONDS = 14 * 60
 POOL_TARGET = int(os.environ.get("POOL_TARGET", "9999999999"))
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "50"))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "5"))
 API_PORT = int(os.environ.get("PORT", os.environ.get("API_PORT", "8080")))
 SOLVER_TIMEOUT = float(os.environ.get("SOLVER_TIMEOUT", "30"))
 
