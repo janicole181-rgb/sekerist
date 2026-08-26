@@ -3,21 +3,18 @@ import asyncio
 import threading
 import time
 import os
-import queue
+import sys
 import aiohttp
 from datetime import datetime, timezone
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 import random
-import sys
-import json
 
 app = Flask(__name__)
 
 # Configuration
 TOKEN_EXPIRY_SECONDS = 14 * 60
 POOL_TARGET = int(os.environ.get("POOL_TARGET", "100"))
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "5"))  # Reduced for Railway
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "5"))
 API_PORT = int(os.environ.get("PORT", os.environ.get("API_PORT", "8080")))
 SOLVER_TIMEOUT = float(os.environ.get("SOLVER_TIMEOUT", "30"))
 
@@ -40,18 +37,20 @@ stats = {
     "pool_size": 0,
     "peak_queue": 0,
     "duplicates_rejected": 0,
-    "tokens_flushed": 0,
     "last_received": "---",
     "last_served": "---",
     "start_time": datetime.now(timezone.utc).isoformat(),
 }
 stats_lock = threading.Lock()
 
-print(f"Starting CN31 Token Server...")
-print(f"Port: {API_PORT}")
-print(f"Workers: {NUM_WORKERS}")
-print(f"Pool target: {POOL_TARGET}")
-print(f"Python version: {sys.version}")
+print(f"\n{'='*60}")
+print(f"  🔐 CN31 Token Server")
+print(f"  Port: {API_PORT}")
+print(f"  Workers: {NUM_WORKERS}")
+print(f"  Pool target: {POOL_TARGET}")
+print(f"  Token expiry: {TOKEN_EXPIRY_SECONDS}s (14 min)")
+print(f"  Python: {sys.version.split()[0]}")
+print(f"{'='*60}\n")
 
 def is_token_fresh(entry):
     age = time.time() - entry["generated_at"]
@@ -103,7 +102,6 @@ def cleanup_served_tokens():
                 served_tokens.pop()
 
 def add_token_to_pool(token_value, worker_id):
-    """Add one successful token to the shared web-server pool."""
     if not token_value:
         return False
 
@@ -138,7 +136,7 @@ def add_token_to_pool(token_value, worker_id):
         if pool_size > stats["peak_queue"]:
             stats["peak_queue"] = pool_size
 
-    print(f"[Worker {worker_id}] Token added (pool: {pool_size}/{POOL_TARGET})")
+    print(f"[Worker {worker_id}] ✅ Token added (pool: {pool_size}/{POOL_TARGET})")
     return True
 
 async def fast_pool_worker(worker_id):
@@ -146,29 +144,29 @@ async def fast_pool_worker(worker_id):
     try:
         import mlbb_async_pydun as fast_solver
         from fake_useragent import UserAgent
-        from loguru import logger
         
-        print(f"[Worker {worker_id}] Initializing solver...")
+        print(f"[Worker {worker_id}] 🚀 Initializing solver...")
         
+        # Check if model loads
         if not fast_solver.initialize_global_model():
-            print(f"[Worker {worker_id}] Model initialization failed")
+            print(f"[Worker {worker_id}] ❌ Model initialization failed")
             return
             
         if not fast_solver._get_py_dun163_ctx():
-            print(f"[Worker {worker_id}] dun163_py backend unavailable")
+            print(f"[Worker {worker_id}] ❌ dun163_py backend unavailable")
             return
 
         try:
             ua = UserAgent().random
         except Exception:
-            ua = "Mozilla/5.0"
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
         domain = fast_solver.DUN163_DOMAINS[
             worker_id % len(fast_solver.DUN163_DOMAINS)
         ]
         recycle_seconds = float(os.environ.get("SESSION_RECYCLE_SECONDS", "300"))
 
-        print(f"[Worker {worker_id}] Ready with persistent async session")
+        print(f"[Worker {worker_id}] ✅ Ready with persistent async session")
         
         while pool_running.is_set():
             connector = aiohttp.TCPConnector(
@@ -204,9 +202,9 @@ async def fast_pool_worker(worker_id):
                     if fast_solver.USE_IRTOKEN:
                         try:
                             ir_token = await fast_solver.request_up()
-                            print(f"[Worker {worker_id}] Got irToken")
+                            print(f"[Worker {worker_id}] ✅ Got irToken")
                         except Exception as exc:
-                            print(f"[Worker {worker_id}] irToken request failed: {exc}")
+                            print(f"[Worker {worker_id}] ⚠️ irToken request failed: {exc}")
 
                     while (
                         pool_running.is_set()
@@ -233,25 +231,25 @@ async def fast_pool_worker(worker_id):
                             if token_value:
                                 consecutive_failures = 0
                                 add_token_to_pool(token_value, worker_id)
-                                print(f"[{worker_id}] Generated token: {token_value[:30]}...")
                             else:
                                 consecutive_failures += 1
                                 with stats_lock:
                                     stats["generation_failures"] += 1
                                 if consecutive_failures >= 10:
-                                    print(f"[Worker {worker_id}] Too many failures, recycling session")
+                                    print(f"[Worker {worker_id}] ⚠️ Too many failures, recycling session")
                                     break
                         except asyncio.TimeoutError:
                             consecutive_failures += 1
                             with stats_lock:
                                 stats["generation_failures"] += 1
                             if consecutive_failures >= 10:
+                                print(f"[Worker {worker_id}] ⚠️ Timeout loop, recycling session")
                                 break
                         except Exception as exc:
                             consecutive_failures += 1
                             with stats_lock:
                                 stats["generation_failures"] += 1
-                            print(f"[Worker {worker_id}] Error: {exc}")
+                            print(f"[Worker {worker_id}] ❌ Error: {exc}")
                             if consecutive_failures >= 10:
                                 break
                         finally:
@@ -261,39 +259,38 @@ async def fast_pool_worker(worker_id):
                         cleanup_served_tokens()
                         await asyncio.sleep(0.1)
             except Exception as exc:
-                print(f"[Worker {worker_id}] Session stopped: {exc}")
+                print(f"[Worker {worker_id}] ❌ Session error: {exc}")
 
             if pool_running.is_set():
                 await asyncio.sleep(1)
                 
     except ImportError as e:
-        print(f"[Worker {worker_id}] Import error: {e}")
-        print(f"[Worker {worker_id}] Make sure mlbb_async_pydun.py and all dependencies exist")
+        print(f"[Worker {worker_id}] ❌ Import error: {e}")
+        print(f"[Worker {worker_id}] Make sure mlbb_async_pydun.py exists")
         return
     except Exception as e:
-        print(f"[Worker {worker_id}] Fatal error: {e}")
+        print(f"[Worker {worker_id}] ❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
         return
 
 def pool_worker(worker_id):
-    """Bridge the Flask thread pool to one persistent async solver loop."""
+    """Bridge thread to async solver loop."""
     try:
-        # Create new event loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(fast_pool_worker(worker_id))
     except Exception as exc:
-        print(f"[Worker {worker_id}] Fatal error: {exc}")
+        print(f"[Worker {worker_id}] ❌ Fatal error: {exc}")
 
 def start_pool():
     pool_running.set()
-    print(f"Starting {NUM_WORKERS} workers...")
+    print(f"\n🚀 Starting {NUM_WORKERS} workers...")
     for i in range(1, NUM_WORKERS + 1):
         t = threading.Thread(target=pool_worker, args=(i,), daemon=True)
         t.start()
-        time.sleep(0.5)  # Stagger startup
-    print(f"✅ Token pool started: {NUM_WORKERS} workers, target {POOL_TARGET}")
+        time.sleep(0.5)
+    print(f"✅ Token pool started: {NUM_WORKERS} workers, target {POOL_TARGET}\n")
 
 def pruner_loop():
     while pool_running.is_set():
@@ -325,6 +322,8 @@ FRONTEND_HTML = r"""
             margin-bottom: 30px;
             padding-bottom: 20px;
             border-bottom: 1px solid #1a1a2e;
+            flex-wrap: wrap;
+            gap: 10px;
         }
         .header h1 {
             font-size: 28px;
@@ -351,8 +350,8 @@ FRONTEND_HTML = r"""
         }
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
             margin-bottom: 30px;
         }
         .card {
@@ -360,9 +359,14 @@ FRONTEND_HTML = r"""
             padding: 20px;
             border-radius: 12px;
             border: 1px solid #1f1f35;
+            transition: all 0.3s;
+        }
+        .card:hover {
+            border-color: #2a2a4a;
+            transform: translateY(-2px);
         }
         .card .label {
-            font-size: 12px;
+            font-size: 11px;
             color: #888;
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -399,6 +403,7 @@ FRONTEND_HTML = r"""
             background: #1a1a2e;
             border-radius: 8px;
             margin-bottom: 8px;
+            flex-wrap: wrap;
         }
         .endpoint .method {
             font-family: monospace;
@@ -447,6 +452,7 @@ FRONTEND_HTML = r"""
         }
         .result-box.show { display: block; }
         .result-box .token { color: #10b981; }
+        .result-box .error { color: #f87171; }
         .footer {
             margin-top: 30px;
             padding-top: 20px;
@@ -454,6 +460,13 @@ FRONTEND_HTML = r"""
             text-align: center;
             color: #666;
             font-size: 13px;
+        }
+        @media (max-width: 600px) {
+            .header { flex-direction: column; align-items: flex-start; }
+            .grid { grid-template-columns: 1fr 1fr; }
+            .card .value { font-size: 24px; }
+            .endpoint { flex-direction: column; align-items: flex-start; }
+            .endpoint .desc { margin-left: 0; }
         }
     </style>
 </head>
@@ -468,7 +481,7 @@ FRONTEND_HTML = r"""
             </div>
         </div>
 
-        <div class="grid">
+        <div class="grid" id="stats-grid">
             <div class="card">
                 <div class="label">Pool Size</div>
                 <div class="value rose" id="pool-size">0</div>
@@ -487,7 +500,7 @@ FRONTEND_HTML = r"""
             </div>
             <div class="card">
                 <div class="label">Rate</div>
-                <div class="value purple" id="rate">0</div>
+                <div class="value purple" id="rate">0/min</div>
             </div>
             <div class="card">
                 <div class="label">Uptime</div>
@@ -521,7 +534,7 @@ FRONTEND_HTML = r"""
         </div>
 
         <div class="footer">
-            CN31 Token Server • TTL 14 minutes • Auto-generating
+            CN31 Token Server • TTL 14 minutes • Auto-generating • Workers: {{ workers }}
         </div>
     </div>
 
@@ -546,11 +559,11 @@ FRONTEND_HTML = r"""
                     result.innerHTML = `<div class="token">✅ ${data.token}</div>`;
                     result.className = 'result-box show';
                 } else {
-                    result.innerHTML = `❌ ${data.error || 'No tokens available'}`;
+                    result.innerHTML = `<div class="error">❌ ${data.error || 'No tokens available'}</div>`;
                     result.className = 'result-box show';
                 }
             } catch (e) {
-                result.innerHTML = `❌ Error: ${e.message}`;
+                result.innerHTML = `<div class="error">❌ Error: ${e.message}</div>`;
                 result.className = 'result-box show';
             }
             
@@ -575,7 +588,7 @@ FRONTEND_HTML = r"""
                     document.getElementById('uptime').textContent = minutes + 'm';
                     
                     const rate = minutes > 0 ? Math.round((data.tokens_generated || 0) / minutes) : 0;
-                    document.getElementById('rate').textContent = rate + '/m';
+                    document.getElementById('rate').textContent = rate + '/min';
                 }
             } catch (e) {
                 console.error('Stats error:', e);
@@ -591,7 +604,7 @@ FRONTEND_HTML = r"""
 
 @app.route("/")
 def index():
-    return render_template_string(FRONTEND_HTML)
+    return render_template_string(FRONTEND_HTML, workers=NUM_WORKERS)
 
 @app.route("/get-token", methods=["GET"])
 def get_token_endpoint():
@@ -627,23 +640,37 @@ def stats_endpoint():
 def health():
     return jsonify({"status": "ok", "pool_size": len(token_pool)})
 
-if __name__ == "__main__":
-    print(f"\n  🔐 CN31 Token Server")
-    print(f"  Port: {API_PORT}")
-    print(f"  Workers: {NUM_WORKERS}")
-    print(f"  Pool target: {POOL_TARGET}")
-    print(f"  Token expiry: {TOKEN_EXPIRY_SECONDS}s (14 min)")
-    print(f"")
-    print(f"  Endpoints:")
-    print(f"    GET /             - Dashboard")
-    print(f"    GET /get-token    - Get 1 fresh token")
-    print(f"    GET /stats        - Pool statistics")
-    print(f"    GET /health       - Health check")
-    print(f"")
+# ============================================
+# MAIN ENTRY POINTS
+# ============================================
 
+def initialize_server():
+    """Initialize the token pool and pruner"""
     start_pool()
-
     pruner_thread = threading.Thread(target=pruner_loop, daemon=True)
     pruner_thread.start()
+    print(f"\n✅ Server ready on port {API_PORT}")
+    print(f"   Dashboard: http://localhost:{API_PORT}/")
+    print(f"   Get token: http://localhost:{API_PORT}/get-token")
+    print(f"   Stats:     http://localhost:{API_PORT}/stats\n")
 
+if __name__ == "__main__":
+    # Running directly with Flask
+    initialize_server()
     app.run(host="0.0.0.0", port=API_PORT, debug=False, threaded=True)
+    
+else:
+    # Running with Gunicorn - start pool when app is imported
+    # This allows Gunicorn workers to also have the pool running
+    import sys
+    
+    # Only start pool once, not per worker
+    if not hasattr(app, '_pool_started'):
+        app._pool_started = True
+        print("🚀 Gunicorn mode: Starting token pool...")
+        
+        # Start pool in main thread for Gunicorn
+        start_pool()
+        pruner_thread = threading.Thread(target=pruner_loop, daemon=True)
+        pruner_thread.start()
+        print("✅ Pool started for Gunicorn workers")
